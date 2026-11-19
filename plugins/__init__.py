@@ -37,10 +37,11 @@ import codecs
 import string
 import fnmatch
 import os.path
+import weakref
 import threading
 import collections.abc
 
-from .. import callbacks, conf, dbi, ircdb, ircutils, i18n, log, utils, world
+from .. import callbacks, conf, dbi, ircdb, irclib, ircutils, i18n, log, utils, world
 from ..commands import *
 
 _ = i18n.PluginInternationalization()
@@ -100,12 +101,16 @@ def getChannel(channel):
 #     to refactor it.
 # XXX We need to get rid of this, it's ugly and opposed to
 #     database-independence.
-class ChannelDBHandler(object):
+class ChannelDBHandler(irclib.IrcCallback):
     """A class to handle database stuff for individual channels transparently.
     """
     suffix = '.db'
     def __init__(self, suffix='.db'):
+        # only main thread's DBs, for backward compatibility
         self.dbCache = ircutils.IrcDict()
+        # {thread: {channel: DB}}
+        self.dbCacheThreads = weakref.WeakKeyDictionary()
+
         suffix = self.suffix
         if self.suffix and self.suffix[0] != '.':
             suffix = '.' + suffix
@@ -123,18 +128,26 @@ class ChannelDBHandler(object):
 
     def getDb(self, channel):
         """Use this to get a database for a specific channel."""
-        currentThread = threading.currentThread()
-        if channel not in self.dbCache and currentThread == world.mainThread:
-            self.dbCache[channel] = self.makeDb(self.makeFilename(channel))
-        if currentThread != world.mainThread:
-            db = self.makeDb(self.makeFilename(channel))
-        else:
-            db = self.dbCache[channel]
+        dbCache = self._getDbCache()
+
+        if channel not in dbCache:
+            dbCache[channel] = self.makeDb(self.makeFilename(channel))
+        db = self.dbCache[channel]
         db.isolation_level = None
         return db
 
+    def _getDbCache(self):
+        currentThread = threading.currentThread()
+        if currentThread == world.mainThread:
+            return self.dbCache
+        else:
+            if currentThread not in self.dbCacheThreads:
+                self.dbCacheThreads[currentThread] = ircutils.IrcDict()
+            return self.dbCacheThreads[currentThread]
+
     def die(self):
-        for db in self.dbCache.values():
+        dbCache = self._getDbCache()
+        for db in dbCache.values():
             try:
                 db.commit()
             except AttributeError: # In case it's not an SQLite database.
@@ -145,6 +158,7 @@ class ChannelDBHandler(object):
                 pass
             del db
         gc.collect()
+        super().die()
 
 
 class DbiChannelDB(object):
@@ -233,33 +247,36 @@ class ChannelUserDB(ChannelUserDictionary):
         except EnvironmentError as e:
             log.warning('Couldn\'t open %s: %s.', self.filename, e)
             return
-        reader = csv.reader(fd)
         try:
-            lineno = 0
-            for t in reader:
-                lineno += 1
-                try:
-                    channel = t.pop(0)
-                    id = t.pop(0)
+            reader = csv.reader(fd)
+            try:
+                lineno = 0
+                for t in reader:
+                    lineno += 1
                     try:
-                        id = int(id)
-                    except ValueError:
-                        # We'll skip over this so, say, nicks can be kept here.
-                        pass
-                    channel = sys.intern(channel)
-                    v = self.deserialize(channel, id, t)
-                    self[channel, id] = v
-                except Exception as e:
-                    log.warning('Invalid line #%s in %s.',
-                                lineno, self.__class__.__name__)
-                    log.debug('Exception: %s', utils.exnToString(e))
-        except Exception as e: # This catches exceptions from csv.reader.
-            log.warning('Invalid line #%s in %s.',
-                        lineno, self.__class__.__name__)
-            log.debug('Exception: %s', utils.exnToString(e))
+                        channel = t.pop(0)
+                        id = t.pop(0)
+                        try:
+                            id = int(id)
+                        except ValueError:
+                            # We'll skip over this so, say, nicks can be kept here.
+                            pass
+                        channel = sys.intern(channel)
+                        v = self.deserialize(channel, id, t)
+                        self[channel, id] = v
+                    except Exception as e:
+                        log.warning('Invalid line #%s in %s.',
+                                    lineno, self.__class__.__name__)
+                        log.debug('Exception: %s', utils.exnToString(e))
+            except Exception as e: # This catches exceptions from csv.reader.
+                log.warning('Invalid line #%s in %s.',
+                            lineno, self.__class__.__name__)
+                log.debug('Exception: %s', utils.exnToString(e))
+        finally:
+            fd.close()
 
     def flush(self):
-        mode = 'wb' if utils.minisix.PY2 else 'w'
+        mode = 'w'
         fd = utils.file.AtomicFile(self.filename, mode, makeBackupIfSmaller=False)
         writer = csv.writer(fd)
         items = list(self.items())
@@ -412,6 +429,7 @@ class ChannelIdDatabasePlugin(callbacks.Plugin):
         Searches for $types matching the criteria given.
         """
         predicates = []
+        regex_arg = None
         def p(record):
             for predicate in predicates:
                 if not predicate(record):
@@ -428,14 +446,21 @@ class ChannelIdDatabasePlugin(callbacks.Plugin):
                     # https://github.com/progval/Limnoria/issues/855 for details
                     irc.errorNoCapability('trusted')
 
-                predicates.append(lambda r: regexp_wrapper(r.text, reobj=arg,
-                        timeout=0.1, plugin_name=self.name(), fcn_name='search'))
+                regex_arg = arg
         if glob:
             def globP(r, glob=glob.lower()):
                 return fnmatch.fnmatch(r.text.lower(), glob)
             predicates.append(globP)
+        candidates = list(self.db.select(channel, p))
+        if regex_arg is not None and candidates:
+            texts = [r.text for r in candidates]
+            matches = batch_regexp_wrapper(
+                texts, reobj=regex_arg, timeout=1,
+                plugin_name=self.name(), fcn_name='search')
+            if matches is not None:
+                candidates = [r for r, m in zip(candidates, matches) if m]
         L = []
-        for record in self.db.select(channel, p):
+        for record in candidates:
             L.append(self.searchSerializeRecord(record))
         if L:
             L.sort()
@@ -514,8 +539,8 @@ class PeriodicFileDownloader(object):
     three-tuples of
     (url, seconds between downloads, function to run with downloaded file).
 
-    'url' should be in some form that urllib2.urlopen can handle (do note that
-    urllib2.urlopen handles file:// links perfectly well.)
+    'url' should be in some form that urllib.request.urlopen can handle (do note
+    that urllib.request.urlopen handles file:// links perfectly well.)
 
     'seconds between downloads' is the number of seconds between downloads,
     obviously.  An important point to remember, however, is that it is only

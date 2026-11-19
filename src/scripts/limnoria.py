@@ -40,7 +40,7 @@ import atexit
 import shutil
 import signal
 
-from io import StringIO  # Import this after version check since this will fail on Python 2
+from io import StringIO
 
 def _termHandler(signalNumber, stackFrame):
     raise SystemExit('Signal #%s.' % signalNumber)
@@ -85,6 +85,7 @@ def run():
     import supybot.ircmsgs as ircmsgs
     import supybot.schedule as schedule
     import supybot.httpserver as httpserver
+    world._registerAtexit()
     # We schedule this event rather than have it actually run because if there
     # is a failure between now and the time it takes the Owner plugin to load
     # all the various plugins, our registry file might be wiped.  That's bad.

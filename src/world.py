@@ -41,10 +41,7 @@ import select
 import threading
 import multiprocessing
 
-import re
-
 from . import conf, ircutils, log, registry
-from .utils import minisix
 
 startedAt = time.time() # Just in case it doesn't get set later.
 
@@ -64,8 +61,25 @@ class SupyThread(threading.Thread, object):
         super(SupyThread, self).__init__(*args, **kwargs)
         log.debug('Spawning thread %q.', self.getName())
 
+try:
+    SUPYPROCESS_MULTIPROCESSING_CONTEXT = multiprocessing.get_context('fork')
+    """
+    Which :mod:`multiprocessing` is used to run :class:`SupyProcess`
+
+    Currently this is (unfortunately) ``fork`` when possible (non-Windows)
+    because functions running in it often need to read the global state.
+    """
+except ValueError:
+    SUPYPROCESS_MULTIPROCESSING_CONTEXT = multiprocessing.get_context()
+    """
+    Which :mod:`multiprocessing` is used to run :class:`SupyProcess`
+
+    Currently this is (unfortunately) ``fork`` when possible (non-Windows)
+    because functions running in it often need to read the global state.
+    """
+
 processesSpawned = 1 # Starts at one for the initial process.
-class SupyProcess(multiprocessing.get_context('fork').Process):
+class SupyProcess(SUPYPROCESS_MULTIPROCESSING_CONTEXT.Process):
     def __init__(self, *args, **kwargs):
         global processesSpawned
         processesSpawned += 1
@@ -153,8 +167,6 @@ def upkeep():
         #if registryFilename is not None:
         #    registry.open(registryFilename)
     if not dying:
-        if minisix.PY2:
-            log.debug('Regexp cache size: %s', len(re._cache))
         log.debug('Pattern cache size: %s', len(ircutils._patternCache))
         log.debug('HostmaskPatternEqual cache size: %s',
                   len(ircutils._hostmaskPatternEqualCache))
@@ -194,13 +206,14 @@ def startDying():
 def finished():
     log.info('Shutdown complete.')
 
-# These are in order; don't reorder them for cosmetic purposes.  The order
-# in which they're registered is the reverse order in which they will run.
-atexit.register(finished)
-atexit.register(upkeep)
-atexit.register(makeIrcsDie)
-atexit.register(makeDriversDie)
-atexit.register(startDying)
+def _registerAtexit():
+    # These are in order; don't reorder them for cosmetic purposes.  The order
+    # in which they're registered is the reverse order in which they will run.
+    atexit.register(finished)
+    atexit.register(upkeep)
+    atexit.register(makeIrcsDie)
+    atexit.register(makeDriversDie)
+    atexit.register(startDying)
 
 ##################################################
 ##################################################

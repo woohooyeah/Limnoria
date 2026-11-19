@@ -40,6 +40,7 @@ from supybot.commands import *
 import supybot.irclib as irclib
 import supybot.ircmsgs as ircmsgs
 import supybot.ircutils as ircutils
+import supybot.registry as registry
 import supybot.callbacks as callbacks
 from supybot.i18n import PluginInternationalization, internationalizeDocstring
 _ = PluginInternationalization('Services')
@@ -69,9 +70,7 @@ class Services(callbacks.Plugin):
     def __init__(self, irc):
         self.__parent = super(Services, self)
         self.__parent.__init__(irc)
-        network = irc.network if irc else None
-        for nick in self.registryValue('nicks', network=network):
-            config.registerNick(nick)
+        self._initializedNetworks = set()
         self.reset()
 
     def reset(self):
@@ -93,7 +92,7 @@ class Services(callbacks.Plugin):
             if not state.identified:
                 if self.registryValue('noJoinsUntilIdentified', network=irc.network):
                     self.log.info('Holding JOIN to %s @ %s until identified.',
-                                  msg.channel, irc.network)
+                                  msg.args[0], irc.network)
                     state.waitingJoins.append(msg)
                     return None
         return msg
@@ -108,7 +107,18 @@ class Services(callbacks.Plugin):
     def _getNickServPassword(self, nick, network):
         # This should later be nick-specific.
         assert nick in self.registryValue('nicks', network=network)
-        return self.registryValue('NickServ.password.%s' % nick, network=network)
+        try:
+            return self.registryValue(f'NickServ.password.{nick}', network=network)
+        except registry.NonExistentRegistryEntry:
+            msg = (
+                f'Nick {nick} is listed in supybot.plugins.Services.nicks, '
+                f'supybot.plugins.NickServ.password.{nick} does not exist. '
+                f'If you manually changed the value, undo it and use the '
+                f'"services password" command instead.'
+            )
+            self.log.error(msg)
+            raise callbacks.Error(msg)
+
 
     def _setNickServPassword(self, nick, password, network):
         # This also should be nick-specific.
@@ -174,6 +184,12 @@ class Services(callbacks.Plugin):
         self.__parent.__call__(irc, msg)
         if self.disabled(irc):
             return
+
+        if irc.network not in self._initializedNetworks:
+            self._initializedNetworks.add(irc.network)
+            for nick in self.registryValue('nicks', network=irc.network):
+                config.registerNick(nick)
+
         state = self._getState(irc)
         nick = self._getNick(irc.network)
         if nick not in self.registryValue('nicks', network=irc.network):
@@ -237,10 +253,25 @@ class Services(callbacks.Plugin):
                 return
             self._doGhost(irc)
 
+    def do477(self, irc, msg):
+        # DALnet: Cannot join channel (+R, need to be identified)
+        state = self._getState(irc)
+        channel = msg.args[1]
+        self.log.debug(
+            'Got 477 (need identified) for %s on %s, will retry after identify.',
+            channel, irc.network
+        )
+        state.channels.append(channel)
+
     def do515(self, irc, msg):
         # Can't join this channel, it's +r (we must be identified).
         state = self._getState(irc)
-        state.channels.append(msg.args[1])
+        channel = msg.args[1]
+        self.log.debug(
+            'Got 515 (need identified) for %s on %s, will retry after identify.',
+            channel, irc.network
+        )
+        state.channels.append(channel)
 
     def doNick(self, irc, msg):
         nick = self._getNick(irc.network)
@@ -258,7 +289,9 @@ class Services(callbacks.Plugin):
     def doNotice(self, irc, msg):
         if irc.afterConnect:
             nickserv = self.registryValue('NickServ', network=irc.network)
+            nickserv = nickserv.split('@')[0]
             chanserv = self.registryValue('ChanServ', network=irc.network)
+            chanserv = chanserv.split('@')[0]
             if nickserv and ircutils.strEqual(msg.nick, nickserv):
                 self.doNickservNotice(irc, msg)
             elif chanserv and ircutils.strEqual(msg.nick, chanserv):
@@ -661,12 +694,6 @@ class Services(callbacks.Plugin):
 
 
     def _checkCanRegister(self, irc, otherIrc):
-        if not conf.supybot.protocols.irc.experimentalExtensions():
-            irc.error(
-                _("Experimental IRC extensions are not enabled for this bot."),
-                Raise=True
-            )
-
         if "draft/account-registration" not in otherIrc.state.capabilities_ls:
             irc.error(
                 _("This network does not support draft/account-registration."),
@@ -682,6 +709,12 @@ class Services(callbacks.Plugin):
         if otherIrc.sasl_authenticated:
             irc.error(
                 _("This bot is already authenticated on the network."),
+                Raise=True
+            )
+
+        if not conf.supybot.protocols.irc.experimentalExtensions():
+            irc.error(
+                _("Experimental IRC extensions are not enabled for this bot."),
                 Raise=True
             )
 

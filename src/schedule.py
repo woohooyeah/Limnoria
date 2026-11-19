@@ -33,8 +33,6 @@ Schedule plugin with a subclass of drivers.IrcDriver in order to be run as a
 Supybot driver.
 """
 
-from __future__ import with_statement
-
 import time
 import heapq
 import functools
@@ -117,12 +115,13 @@ class Schedule(drivers.IrcDriver):
             nonlocal count
             try:
                 f(*args, **kwargs)
-            finally:
+            except Exception:
+                log.exception('Uncaught exception in scheduled function:')
                 # Even if it raises an exception, let's schedule it.
-                if count is not None:
-                    count -= 1
-                if count is None or count > 0:
-                    return self.addEvent(wrapper, time.time() + t, name)
+            if count is not None:
+                count -= 1
+            if count is None or count > 0:
+                return self.addEvent(wrapper, time.time() + t, name)
         return wrapper
 
     def addPeriodicEvent(

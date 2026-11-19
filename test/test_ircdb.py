@@ -38,7 +38,7 @@ import supybot.conf as conf
 import supybot.world as world
 import supybot.ircdb as ircdb
 import supybot.ircutils as ircutils
-from supybot.utils.minisix import io
+from io import StringIO
 
 class IrcdbTestCase(SupyTestCase):
     def setUp(self):
@@ -397,10 +397,10 @@ class IrcNetworkTestCase(IrcdbTestCase):
         n.addDisconnection('baz')
         disconnect_time_foo = n.lastDisconnectTimes['foo']
         disconnect_time_baz = n.lastDisconnectTimes['baz']
-        fd = io.StringIO()
+        fd = StringIO()
         n.preserve(fd, indent='    ')
         fd.seek(0)
-        self.assertCountEqual(fd.read().split('\n'), [
+        self.assertCountEqual(fd.read().split(os.linesep), [
             '    stsPolicy foo 123 sts1',
             '    stsPolicy bar 456 sts2',
             '    lastDisconnectTime foo %d' % disconnect_time_foo,
@@ -492,7 +492,7 @@ class NetworksDictionaryTestCase(IrcdbTestCase):
         disconnect_time_baz = n.lastDisconnectTimes['baz']
         self.networks.setNetwork('foonet', n)
 
-        fd = io.StringIO()
+        fd = StringIO()
         fd.close = lambda: None
         self.networks.filename = 'blah'
         original_Atomicfile = utils.file.AtomicFile
@@ -500,7 +500,7 @@ class NetworksDictionaryTestCase(IrcdbTestCase):
                 'supybot.utils.file.AtomicFile', return_value=fd):
             self.networks.flush()
 
-        lines = fd.getvalue().split('\n')
+        lines = fd.getvalue().split(os.linesep)
         self.assertEqual(lines.pop(0), 'network foonet')
         self.assertCountEqual(lines, [
             '  stsPolicy foo 123 sts1',
@@ -524,7 +524,7 @@ class NetworksDictionaryTestCase(IrcdbTestCase):
         n.addStsPolicy('baz', 789, 'sts3')
         self.networks.setNetwork('baznet', n)
 
-        fd = io.StringIO()
+        fd = StringIO()
         fd.close = lambda: None
         self.networks.filename = 'blah'
         original_Atomicfile = utils.file.AtomicFile
@@ -533,17 +533,18 @@ class NetworksDictionaryTestCase(IrcdbTestCase):
             self.networks.flush()
 
         fd.seek(0)
-        self.assertEqual(fd.getvalue(),
-            'network barnet\n'
-            '  stsPolicy bar 456 sts2\n'
-            '\n'
-            'network baznet\n'
-            '  stsPolicy baz 789 sts3\n'
-            '\n'
-            'network foonet\n'
-            '  stsPolicy foo 123 sts1\n'
-            '\n'
-        )
+        self.assertEqual(fd.getvalue().split(os.linesep), [
+            'network barnet',
+            '  stsPolicy bar 456 sts2',
+            '',
+            'network baznet',
+            '  stsPolicy baz 789 sts3',
+            '',
+            'network foonet',
+            '  stsPolicy foo 123 sts1',
+            '',
+            '',
+        ])
 
 
 class CheckCapabilityTestCase(IrcdbTestCase):

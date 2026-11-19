@@ -1,7 +1,7 @@
 ###
 # Copyright (c) 2002-2005, Jeremiah Fincher
 # Copyright (c) 2009-2010,2015, James McCoy
-# Copyright (c) 2010-2021, Valentin Lorentz
+# Copyright (c) 2010-2026, Valentin Lorentz
 # All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
@@ -36,8 +36,9 @@ Includes wrappers for commands.
 import time
 import getopt
 import inspect
+import queue
 import threading
-import multiprocessing #python2.6 or later!
+import multiprocessing
 
 try:
     import resource
@@ -47,7 +48,6 @@ except ImportError: # Windows!
 from . import callbacks, conf, ircdb, ircmsgs, ircutils, log, \
         utils, world
 from .dynamicScope import dynamic
-from .utils import minisix
 from .i18n import PluginInternationalization, internationalizeDocstring
 _ = PluginInternationalization()
 
@@ -87,7 +87,7 @@ def _rlimit_min(a, b):
     elif b == resource.RLIM_INFINITY:
         return a
     else:
-        return min(soft, heap_size)
+        return min(a, b)
 
 def _process_target(f, q, heap_size, *args, **kwargs):
     """Called by :func:`process`"""
@@ -102,6 +102,17 @@ def _process_target(f, q, heap_size, *args, **kwargs):
         q.put([False, r])
     except Exception as e:
         q.put([True, e])
+
+def _process_queued_target(f_q, q, heap_size, *args, load_plugin_modules, **kwargs):
+    """Called by :func:`process` on non-``fork`` multiprocessing contexts"""
+    from .plugin import loadPluginModule
+
+    for plugin in load_plugin_modules:
+        loadPluginModule(plugin, ignoreDeprecation=True)
+
+    f = f_q.get()
+    _process_target(f, q, heap_size, *args, **kwargs)
+
 
 def process(f, *args, **kwargs):
     """Runs a function <f> in a subprocess.
@@ -121,13 +132,14 @@ def process(f, *args, **kwargs):
     if world.disableMultiprocessing:
         pn = kwargs.pop('pn', 'Unknown')
         cn = kwargs.pop('cn', 'unknown')
+        kwargs.pop('load_plugin_modules', None)
         try:
             return f(*args, **kwargs)
         except Exception as e:
             raise e
     
     try:
-        q = multiprocessing.Queue()
+        q = world.SUPYPROCESS_MULTIPROCESSING_CONTEXT.Queue()
     except OSError:
         log.error('Using multiprocessing.Queue raised an OSError.\n'
                 'This is probably caused by your system denying semaphore\n'
@@ -137,9 +149,25 @@ def process(f, *args, **kwargs):
                 '(See https://github.com/travis-ci/travis-core/issues/187\n'
                 'for more information about this bug.)\n')
         raise
-    targetArgs = (f, q, heap_size) + args
-    p = callbacks.CommandProcess(target=_process_target,
-                                 args=targetArgs, kwargs=kwargs)
+    if hasattr(multiprocessing.context, "ForkContext") and \
+            isinstance(world.SUPYPROCESS_MULTIPROCESSING_CONTEXT,
+                       multiprocessing.context.ForkContext):
+        # no need to pickle f
+        targetArgs = (f, q, heap_size) + args
+        kwargs.pop('load_plugin_modules', None)
+        p = callbacks.CommandProcess(target=_process_target,
+                                     args=targetArgs, kwargs=kwargs)
+    else:
+        # f must be picklable, but it probably comes from a plugin module,
+        # so we need to load the plugin module first, before unpickling it.
+        # so we put it on the queue instead of an argument.
+        f_q = world.SUPYPROCESS_MULTIPROCESSING_CONTEXT.Queue()
+        f_q.put(f)
+        targetArgs = (f_q, q, heap_size) + args
+        if 'load_plugin_modules' not in kwargs:
+            kwargs['load_plugin_modules'] = []
+        p = callbacks.CommandProcess(target=_process_queued_target,
+                                     args=targetArgs, kwargs=kwargs)
     try:
         p.start()
     except OSError as e:
@@ -158,7 +186,7 @@ def process(f, *args, **kwargs):
         raise ProcessTimeoutError("%s aborted due to timeout." % (p.name,))
     try:
         raised, v = q.get(block=False)
-    except minisix.queue.Empty:
+    except queue.Empty:
         return None
     finally:
         q.close()
@@ -172,19 +200,46 @@ def regexp_wrapper(s, reobj, timeout, plugin_name, fcn_name):
     '''A convenient wrapper to stuff regexp search queries through a subprocess.
 
     This is used because specially-crafted regexps can use exponential time
-    and hang the bot.'''
-    def re_bool(s, reobj):
-        """Since we can't enqueue match objects into the multiprocessing queue,
-        we'll just wrap the function to return bools."""
-        if reobj.search(s) is not None:
-            return True
-        else:
-            return False
+    and hang the bot.
+
+    Use :`batch_regexp_wrapper` if you need to check multiple strings.'''
     try:
-        v = process(re_bool, s, reobj, timeout=timeout, pn=plugin_name, cn=fcn_name)
+        v = process(_re_bool, s, reobj, timeout=timeout, pn=plugin_name, cn=fcn_name)
         return v
     except ProcessTimeoutError:
         return None
+
+def _re_bool(s, reobj):
+    """(helper for :func:`regexp_wrapper`)
+
+    _Since we can't enqueue match objects into the multiprocessing queue,
+    we'll just wrap the function to return bools."""
+    if reobj.search(s) is not None:
+        return True
+    else:
+        return False
+
+def batch_regexp_wrapper(strings, reobj, timeout, plugin_name, fcn_name):
+    """Like :func:`regexp_wrapper`, but checks all strings in a single subprocess.
+
+    Returns a list of bools parallel to ``strings`` indicating matches.
+    Returns None on timeout."""
+    if not strings:
+        return []
+    try:
+        return process(
+            _re_filter_batch, strings, reobj,
+            timeout=timeout, pn=plugin_name, cn=fcn_name
+        )
+    except ProcessTimeoutError:
+        return None
+
+def _re_filter_batch(strings, reobj):
+    """(helper for batch_regexp_wrapper)
+
+    Returns a list of bools, one per string, indicating whether the regex
+    matched."""
+    return [reobj.search(s) is not None for s in strings]
 
 class UrlSnarfThread(world.SupyThread):
     def __init__(self, *args, **kwargs):
@@ -311,7 +366,7 @@ def getNonInt(irc, msg, args, state, type=_('non-integer value')):
 
 def getLong(irc, msg, args, state, type='long'):
     getInt(irc, msg, args, state, type)
-    state.args[-1] = minisix.long(state.args[-1])
+    state.args[-1] = int(state.args[-1])
 
 def getFloat(irc, msg, args, state, type=_('floating point number')):
     try:
@@ -760,7 +815,7 @@ def getMatch(irc, msg, args, state, regexp, errmsg):
 
 def getLiteral(irc, msg, args, state, literals, errmsg=None):
     # ??? Should we allow abbreviations?
-    if isinstance(literals, minisix.string_types):
+    if isinstance(literals, str):
         literals = (literals,)
     abbrevs = utils.abbrev(literals)
     if args[0] in abbrevs:
@@ -910,7 +965,7 @@ class context(object):
             self.converter = getConverter(spec[0])
         elif spec is None:
             self.converter = getConverter('anything')
-        elif isinstance(spec, minisix.string_types):
+        elif isinstance(spec, str):
             self.args = ()
             self.converter = getConverter(spec)
         else:
@@ -1231,7 +1286,7 @@ __all__ = [
     # Decorators.
     'urlSnarfer', 'thread',
     # Functions.
-    'wrap', 'process', 'regexp_wrapper',
+    'wrap', 'process', 'regexp_wrapper', 'batch_regexp_wrapper',
     # Stuff for testing.
     'Spec',
 ]
